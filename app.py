@@ -10,10 +10,11 @@ import pandas as pd
 import datetime
 import requests
 from streamlit_gsheets import GSheetsConnection
+import gspread
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="AK & AA Shared Expense Tracker (AKAASET)",
+    page_title="AK & AA Shared Expense Tracker",
     page_icon="💸",
     layout="wide"
 )
@@ -69,14 +70,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- GOOGLE SHEETS CONNECTION ---
-# Establish connection using st.secrets.
-# The default name for the connection is "gsheets".
-# The secrets should be stored in [connections.gsheets]
+# --- GOOGLE SHEETS CONNECTION (Using streamlit_gsheets as requested) ---
 try:
+    # Connect using the name "gsheets" which maps to [connections.gsheets] in secrets
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` file is configured correctly under `[connections.gsheets]`.")
+    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` is configured correctly under `[connections.gsheets]`.")
     st.error(f"Error details: {e}")
     st.stop()
 
@@ -90,35 +89,57 @@ def get_location():
     except requests.RequestException:
         return "Location N/A"
 
-@st.cache_data(ttl=60) # Cache data for 60 seconds to reduce API calls
+@st.cache_data(ttl=30) # Cache data for 30 seconds
 def load_data():
     """Loads and cleans transaction data from the Google Sheet."""
     try:
-        # Assuming the data is in the first sheet of the connected Google Sheets file.
         df = conn.read(worksheet="Sheet1", usecols=list(range(8)))
         df.dropna(how="all", inplace=True)
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        # Handle potential errors if timestamp or date columns are malformed
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-        df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce').dt.date
+        df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce')
         # Sort by transaction date to ensure chronological calculations
         df = df.sort_values(by="Date of Transaction").reset_index(drop=True)
         return df
+    except gspread.exceptions.WorksheetNotFound:
+         st.error("Worksheet 'Sheet1' not found. Please ensure your Google Sheet has a sheet with this exact name.")
     except Exception as e:
         st.error(f"Failed to load data from Google Sheets: {e}")
-        # Return an empty dataframe with correct columns if loading fails
-        return pd.DataFrame(columns=[
-            'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 
-            'Entered by', 'Timestamp', 'Location'
-        ])
+    
+    # Return an empty dataframe with correct columns if loading fails
+    return pd.DataFrame(columns=[
+        'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 
+        'Entered by', 'Timestamp', 'Location'
+    ])
 
-def save_data(df):
-    """Saves the DataFrame to the Google Sheet by overwriting it."""
+def save_data_on_edit(df):
+    """Saves the entire DataFrame to the Google Sheet, overwriting it. Used by the data editor."""
     try:
-        # Clear the cache before writing to ensure fresh data on next read
         st.cache_data.clear()
-        conn.write(worksheet="Sheet1", data=df)
+        # The .update() method may not be available on all connection objects,
+        # so we get the underlying worksheet to perform a robust clear and write.
+        spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        worksheet_name = st.secrets["connections"]["gsheets"]["worksheet"]
+        worksheet = conn.client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
+        
+        worksheet.clear()
+        worksheet.update([df.columns.values.tolist()] + df.values.tolist())
     except Exception as e:
-        st.error(f"Failed to save data to Google Sheets: {e}")
+        st.error(f"Failed to save changes to Google Sheets: {e}")
+
+def append_new_transaction(new_entry_df):
+    """Appends a new row to the Google Sheet. More efficient for single additions."""
+    try:
+        spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        worksheet_name = st.secrets["connections"]["gsheets"]["worksheet"]
+        worksheet = conn.client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
+        
+        worksheet.append_rows(new_entry_df.values.tolist(), value_input_option='USER_ENTERED')
+        st.cache_data.clear() # Clear cache to force a reload on the next run
+    except Exception as e:
+        st.error(f"Failed to add new transaction to Google Sheets: {e}")
+
 
 # --- AUTHENTICATION ---
 def check_password():
@@ -131,7 +152,6 @@ def check_password():
 
     def password_entered():
         try:
-            # Assumes secrets are in [credentials.users]
             user_credentials = st.secrets["credentials"]["users"]
             username = st.session_state["username"]
             password = st.session_state["password"]
@@ -151,7 +171,6 @@ def check_password():
             st.error(f"An error occurred during login: {e}")
             st.session_state["user_logged_in"] = False
 
-
     if st.session_state.get("user_logged_in", False):
         return True
 
@@ -170,12 +189,13 @@ if st.sidebar.button("Logout"):
 
 # --- Load Data ---
 transactions_df = load_data()
+# Convert date column to date objects for filtering, handling NaT (Not a Time) values
+transactions_df['Date of Transaction'] = pd.to_datetime(transactions_df['Date of Transaction']).dt.date
 
 # --- BALANCE CALCULATION ---
 def calculate_balance_and_summary(df):
     """Calculates the balance and a summary dictionary for display."""
     if df.empty:
-        # Return a zero-filled summary if the dataframe is empty
         return 0.0, {
             'total_paid_by_AK': 0, 'total_paid_by_AA': 0, 'shared_expenses': 0,
             'shared_paid_by_ak': 0, 'shared_paid_by_aa': 0, 'ak_only_paid_by_aa': 0,
@@ -194,9 +214,7 @@ def calculate_balance_and_summary(df):
         'repayment_aa_to_ak': df[df['Type'] == 'Repayment from AA to AK']['Amount'].sum(),
     }
     
-    # Balance from AK's perspective: Positive means AA owes AK.
     balance = 0.0
-    # Avoid division by zero if there are no shared expenses
     ak_share = summary['shared_expenses'] / 2.0 if summary['shared_expenses'] > 0 else 0.0
     ak_overpayment_on_shared = summary['shared_paid_by_ak'] - ak_share
     
@@ -209,7 +227,7 @@ def calculate_balance_and_summary(df):
     return balance, summary
 
 # --- UI DISPLAY ---
-st.title("💸 AK & AA Shared Expense Tracker (AKAASET)")
+st.title("💸 AK & AA Shared Expense Tracker")
 st.markdown("A persistent expense tracker powered by Google Sheets.")
 st.markdown("---")
 
@@ -272,7 +290,6 @@ with st.expander("Show Calculation Breakdown"):
                 f"**= FINAL BALANCE:** `₹{balance:,.2f}`")
     st.info("A positive final balance means AA owes AK. A negative balance means AK owes AA.")
 
-    # --- DETAILED LOGIC RESTORED HERE ---
     with st.expander("Show Detailed Transaction-by-Transaction Log"):
         running_balance = 0.0
         st.markdown(f"**Initial Balance:** `₹{running_balance:,.2f}`")
@@ -320,7 +337,7 @@ with st.sidebar:
         amount = st.number_input("Amount (₹)", min_value=0.01, format="%.2f")
         transaction_date = st.date_input("Date of Transaction", datetime.date.today())
         paid_by = st.selectbox("Paid by", ["AK", "AA"], index=0)
-        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AA to AK'], index=0)
+        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AK to AK'], index=0)
         
         if st.form_submit_button("Add Transaction"):
             if not transaction or amount <= 0:
@@ -333,15 +350,14 @@ with st.sidebar:
                     "Location": get_location()
                 }])
                 
-                updated_df = pd.concat([transactions_df, new_entry], ignore_index=True)
-                save_data(updated_df)
+                append_new_transaction(new_entry)
                 st.success("Transaction added!")
                 st.rerun()
 
 st.markdown("---")
 st.header("Transaction History")
 
-# --- FILTERING CONTROLS ADDED HERE ---
+# --- Filtering Controls ---
 filtered_df = transactions_df.copy()
 st.subheader("Filter Transactions")
 filter_cols = st.columns([1, 1, 2])
@@ -361,15 +377,20 @@ with filter_cols[1]:
     )
 
 with filter_cols[2]:
-    if not transactions_df.empty:
-        min_date = transactions_df["Date of Transaction"].min()
-        max_date = transactions_df["Date of Transaction"].max()
-        date_range = st.date_input(
-            "Select date range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
+    # Ensure dataframe is not empty and date column exists before finding min/max
+    if not transactions_df.empty and 'Date of Transaction' in transactions_df.columns:
+        valid_dates = transactions_df['Date of Transaction'].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min()
+            max_date = valid_dates.max()
+            date_range = st.date_input(
+                "Select date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
+        else:
+            date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
     else:
         date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
 
@@ -379,13 +400,13 @@ if paid_by_filter:
     filtered_df = filtered_df[filtered_df["Paid by"].isin(paid_by_filter)]
 if type_filter:
     filtered_df = filtered_df[filtered_df["Type"].isin(type_filter)]
-if len(date_range) == 2:
+if len(date_range) == 2 and not filtered_df.empty:
+    # Safely convert to date objects for comparison
     filtered_df = filtered_df[
         (filtered_df["Date of Transaction"] >= date_range[0]) &
         (filtered_df["Date of Transaction"] <= date_range[1])
     ]
 
-# Display the filtered dataframe as a read-only table
 st.dataframe(filtered_df, use_container_width=True)
 
 st.markdown("---")
@@ -406,9 +427,7 @@ edited_df = st.data_editor(
 )
 
 # --- Save edits back to Google Sheets ---
-# Check if the dataframe from the editor is different from the original one
 if not transactions_df.equals(edited_df):
-    save_data(edited_df)
+    save_data_on_edit(edited_df)
     st.toast("Changes saved!", icon="✅")
-    # A rerun is needed here to reflect the saved changes in calculations
     st.rerun()
