@@ -7,13 +7,13 @@ Created on Wed Oct  8 12:14:00 2025
 
 import streamlit as st
 import pandas as pd
-from pathlib import Path
 import datetime
 import requests
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ak & Aa Shared Expense Tracker (AKAASET)",
+    page_title="AK & AA Shared Expense Tracker (AKAASET)",
     page_icon="💸",
     layout="wide"
 )
@@ -69,9 +69,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- GOOGLE SHEETS CONNECTION ---
+# Establish connection using st.secrets.
+# The default name for the connection is "gsheets".
+# The secrets should be stored in [connections.gsheets]
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception as e:
+    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` file is configured correctly under `[connections.gsheets]`.")
+    st.error(f"Error details: {e}")
+    st.stop()
 
-# --- FILE PATHS & DATA HANDLING ---
-DATA_FILE = Path(__file__).parent / "transactions.csv"
 
 def get_location():
     """Fetches the user's estimated location based on IP address."""
@@ -82,24 +90,35 @@ def get_location():
     except requests.RequestException:
         return "Location N/A"
 
+@st.cache_data(ttl=60) # Cache data for 60 seconds to reduce API calls
 def load_data():
-    """Loads transaction data from the CSV file, creating it if it doesn't exist."""
-    if not DATA_FILE.is_file():
-        df = pd.DataFrame(columns=[
+    """Loads and cleans transaction data from the Google Sheet."""
+    try:
+        # Assuming the data is in the first sheet of the connected Google Sheets file.
+        df = conn.read(worksheet="Sheet1", usecols=list(range(8)))
+        df.dropna(how="all", inplace=True)
+        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+        df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce').dt.date
+        # Sort by transaction date to ensure chronological calculations
+        df = df.sort_values(by="Date of Transaction").reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.error(f"Failed to load data from Google Sheets: {e}")
+        # Return an empty dataframe with correct columns if loading fails
+        return pd.DataFrame(columns=[
             'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 
             'Entered by', 'Timestamp', 'Location'
         ])
-        df.to_csv(DATA_FILE, index=False)
-    
-    df = pd.read_csv(DATA_FILE)
-    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-    df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce').dt.date
-    return df
 
 def save_data(df):
-    """Saves the DataFrame to the CSV file."""
-    df.to_csv(DATA_FILE, index=False)
+    """Saves the DataFrame to the Google Sheet by overwriting it."""
+    try:
+        # Clear the cache before writing to ensure fresh data on next read
+        st.cache_data.clear()
+        conn.write(worksheet="Sheet1", data=df)
+    except Exception as e:
+        st.error(f"Failed to save data to Google Sheets: {e}")
 
 # --- AUTHENTICATION ---
 def check_password():
@@ -112,11 +131,11 @@ def check_password():
 
     def password_entered():
         try:
+            # Assumes secrets are in [credentials.users]
             user_credentials = st.secrets["credentials"]["users"]
             username = st.session_state["username"]
             password = st.session_state["password"]
             
-            # Using get method to avoid KeyError if username doesn't exist
             if user_credentials.get(username) == password:
                 st.session_state["user_logged_in"] = True
                 st.session_state["user"] = username
@@ -125,9 +144,13 @@ def check_password():
             else:
                 st.session_state["user_logged_in"] = False
                 st.error("😕 User not known or password incorrect")
+        except KeyError:
+             st.error("User credentials not found in secrets.toml. Please ensure they are under `[credentials.users]`.")
+             st.session_state["user_logged_in"] = False
         except Exception as e:
-            st.error(f"Credentials not found in secrets.toml or error: {e}")
+            st.error(f"An error occurred during login: {e}")
             st.session_state["user_logged_in"] = False
+
 
     if st.session_state.get("user_logged_in", False):
         return True
@@ -150,10 +173,15 @@ transactions_df = load_data()
 
 # --- BALANCE CALCULATION ---
 def calculate_balance_and_summary(df):
-    """
-    Calculates the balance from AK's perspective based on independent transaction components.
-    A positive balance means AA owes AK. A negative balance means AK owes AA.
-    """
+    """Calculates the balance and a summary dictionary for display."""
+    if df.empty:
+        # Return a zero-filled summary if the dataframe is empty
+        return 0.0, {
+            'total_paid_by_AK': 0, 'total_paid_by_AA': 0, 'shared_expenses': 0,
+            'shared_paid_by_ak': 0, 'shared_paid_by_aa': 0, 'ak_only_paid_by_aa': 0,
+            'aa_only_paid_by_ak': 0, 'repayment_ak_to_aa': 0, 'repayment_aa_to_ak': 0,
+        }
+        
     summary = {
         'total_paid_by_AK': df[df['Paid by'] == 'AK']['Amount'].sum(),
         'total_paid_by_AA': df[df['Paid by'] == 'AA']['Amount'].sum(),
@@ -166,34 +194,29 @@ def calculate_balance_and_summary(df):
         'repayment_aa_to_ak': df[df['Type'] == 'Repayment from AA to AK']['Amount'].sum(),
     }
     
+    # Balance from AK's perspective: Positive means AA owes AK.
     balance = 0.0
+    # Avoid division by zero if there are no shared expenses
+    ak_share = summary['shared_expenses'] / 2.0 if summary['shared_expenses'] > 0 else 0.0
+    ak_overpayment_on_shared = summary['shared_paid_by_ak'] - ak_share
     
-    # 1. Net contribution from shared expenses
-    ak_share = summary['shared_expenses'] / 2
-    # This calculates (AK's contribution to shared pool) - (AK's actual share)
-    balance += (summary['shared_paid_by_ak'] - ak_share)
-
-    # 2. Individual expenses
-    balance += summary['aa_only_paid_by_ak']  # AK paid for AA (+)
-    balance -= summary['ak_only_paid_by_aa']  # AA paid for AK (-)
-
-    # 3. Repayments
-    # Following detailed log logic: if AK repays AA, their net contribution increases.
-    balance += summary['repayment_ak_to_aa'] 
-    # If AA repays AK, the debt owed to AK is reduced.
-    balance -= summary['repayment_aa_to_ak']
+    balance += ak_overpayment_on_shared
+    balance += summary['aa_only_paid_by_ak']
+    balance -= summary['ak_only_paid_by_aa']
+    balance -= summary['repayment_ak_to_aa']
+    balance += summary['repayment_aa_to_ak']
 
     return balance, summary
 
-
 # --- UI DISPLAY ---
 st.title("💸 AK & AA Shared Expense Tracker (AKAASET)")
+st.markdown("A persistent expense tracker powered by Google Sheets.")
 st.markdown("---")
 
 # --- Dashboard Metrics ---
 col1, col2, col3 = st.columns(3)
-total_shared = transactions_df[transactions_df['Type'] == 'Shared Expense']['Amount'].sum()
-total_paid_by_user = transactions_df[transactions_df['Paid by'] == st.session_state['user']]['Amount'].sum()
+total_shared = transactions_df['Amount'][transactions_df['Type'] == 'Shared Expense'].sum()
+total_paid_by_user = transactions_df['Amount'][transactions_df['Paid by'] == st.session_state['user']].sum()
 col1.metric("Total Shared Spending", f"₹{total_shared:,.2f}")
 col2.metric(f"Total Paid by You ({st.session_state['user']})", f"₹{total_paid_by_user:,.2f}")
 col3.metric("Total Transactions", f"{len(transactions_df)}")
@@ -203,119 +226,91 @@ st.markdown("---")
 # --- Net Balance Display ---
 balance, summary_data = calculate_balance_and_summary(transactions_df)
 
-# Centering the card
 _, center_col, _ = st.columns([1, 2, 1])
 with center_col:
     if balance > 0.01:
-        card_class = "positive"
-        title = "Final Balance: AA owes AK"
-        amount_display = f"₹{balance:,.2f}"
+        card_class, title, amount_display = "positive", "Final Balance: AA owes AK", f"₹{balance:,.2f}"
     elif balance < -0.01:
-        card_class = "negative"
-        title = "Final Balance: AK owes AA"
-        amount_display = f"₹{-balance:,.2f}"
+        card_class, title, amount_display = "negative", "Final Balance: AK owes AA", f"₹{-balance:,.2f}"
     else:
-        card_class = "neutral"
-        title = "You are all settled up!"
-        amount_display = "₹0.00"
+        card_class, title, amount_display = "neutral", "You are all settled up!", "₹0.00"
 
-    st.markdown(f"""
-    <div class="balance-card {card_class}">
-        <h3>{title}</h3>
-        <p class="amount">{amount_display}</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f'<div class="balance-card {card_class}"><h3>{title}</h3><p class="amount">{amount_display}</p></div>', unsafe_allow_html=True)
 
 
 # --- Calculation Transparency ---
-with st.expander("Show Calculation Breakdown", expanded=False):
-    st.subheader("High-Level Summary")
+with st.expander("Show Calculation Breakdown"):
+    st.subheader("High-Level Summary (from AK's perspective)")
     
-    ak_share = summary_data['shared_expenses'] / 2
+    ak_share = summary_data['shared_expenses'] / 2.0 if summary_data['shared_expenses'] > 0 else 0.0
     ak_overpayment = summary_data['shared_paid_by_ak'] - ak_share
     
     st.markdown("##### 1. Shared Costs Analysis")
-    st.markdown(f"""
-    - **Total Shared Expenses:** `₹{summary_data['shared_expenses']:,.2f}`
-    - **Each Person's Share (50%):** `₹{ak_share:,.2f}`
-    - **Amount AK Paid for Shared Costs:** `₹{summary_data['shared_paid_by_ak']:,.2f}`
-    - **Amount AA Paid for Shared Costs:** `₹{summary_data['shared_paid_by_aa']:,.2f}`
-    """)
+    st.markdown(f"- **Total Shared Expenses:** `₹{summary_data['shared_expenses']:,.2f}`\n"
+                f"- **Each Person's Share (50%):** `₹{ak_share:,.2f}`\n"
+                f"- **Amount AK Paid for Shared Costs:** `₹{summary_data['shared_paid_by_ak']:,.2f}`\n"
+                f"- **Amount AA Paid for Shared Costs:** `₹{summary_data['shared_paid_by_aa']:,.2f}`")
     if ak_overpayment > 0:
-        st.success(f"Logic: AK paid `₹{ak_overpayment:,.2f}` more than their share, which AA underpaid. This amount is a credit for AK.")
+        st.success(f"Logic: AK paid `₹{ak_overpayment:,.2f}` more than their share. This is a credit for AK.")
     else:
-        st.warning(f"Logic: AK paid `₹{-ak_overpayment:,.2f}` less than their share. This amount is a debit for AK.")
+        st.warning(f"Logic: AK paid `₹{-ak_overpayment:,.2f}` less than their share. This is a debit for AK.")
     st.markdown("---")
 
     st.markdown("##### 2. Individual Costs & Repayments")
-    st.markdown(f"""
-    - **Costs for AA Only (Paid by AK):** `₹{summary_data['aa_only_paid_by_ak']:,.2f}` (Credit for AK)
-    - **Costs for AK Only (Paid by AA):** `₹{summary_data['ak_only_paid_by_aa']:,.2f}` (Debit for AK)
-    - **Repayments from AK to AA:** `₹{summary_data['repayment_ak_to_aa']:,.2f}` (Debit for AK)
-    - **Repayments from AA to AK:** `₹{summary_data['repayment_aa_to_ak']:,.2f}` (Credit for AK)
-    """)
+    st.markdown(f"- **Costs for AA Only (Paid by AK):** `₹{summary_data['aa_only_paid_by_ak']:,.2f}` (Credit for AK)\n"
+                f"- **Costs for AK Only (Paid by AA):** `₹{summary_data['ak_only_paid_by_aa']:,.2f}` (Debit for AK)\n"
+                f"- **Repayments from AA to AK:** `₹{summary_data['repayment_aa_to_ak']:,.2f}` (Credit for AK)\n"
+                f"- **Repayments from AK to AA:** `₹{summary_data['repayment_ak_to_aa']:,.2f}` (Debit for AK)")
     st.markdown("---")
 
-    st.markdown("##### 3. Final Calculation Narrative")
-    balance_step1 = -summary_data['ak_only_paid_by_aa']
-    st.markdown(f"**Step 1:** Start with the amount AK owes AA for 'AK only' costs paid by AA: `₹{-balance_step1:,.2f}`")
-    
-    balance_step2 = balance_step1 + ak_overpayment
-    st.markdown(f"**Step 2:** Add the amount AK overpaid on shared costs (a credit for AK): `₹{balance_step1:,.2f} + ₹{ak_overpayment:,.2f} = ₹{balance_step2:,.2f}`")
-    
-    balance_step3 = balance_step2 + summary_data['aa_only_paid_by_ak']
-    st.markdown(f"**Step 3:** Add costs AK paid for AA only (another credit for AK): `₹{balance_step2:,.2f} + ₹{summary_data['aa_only_paid_by_ak']:,.2f} = ₹{balance_step3:,.2f}`")
+    st.markdown("##### 3. Final Calculation")
+    st.markdown(f"**Net from Shared Costs:** `₹{ak_overpayment:,.2f}`\n"
+                f"**+ Costs AK paid for AA:** `+ ₹{summary_data['aa_only_paid_by_ak']:,.2f}`\n"
+                f"**- Costs AA paid for AK:** `- ₹{summary_data['ak_only_paid_by_aa']:,.2f}`\n"
+                f"**+ Repayments from AA:** `+ ₹{summary_data['repayment_aa_to_ak']:,.2f}`\n"
+                f"**- Repayments from AK:** `- ₹{summary_data['repayment_ak_to_aa']:,.2f}`\n"
+                f"**= FINAL BALANCE:** `₹{balance:,.2f}`")
+    st.info("A positive final balance means AA owes AK. A negative balance means AK owes AA.")
 
-    balance_step4 = balance_step3 + summary_data['repayment_aa_to_ak']
-    st.markdown(f"**Step 4:** Add repayments AA made to AK (a credit for AK): `₹{balance_step3:,.2f} + ₹{summary_data['repayment_aa_to_ak']:,.2f} = ₹{balance_step4:,.2f}`")
-    
-    balance_step5 = balance_step4 - summary_data['repayment_ak_to_aa']
-    st.markdown(f"**Step 5:** Subtract repayments AK made to AA (a debit for AK): `₹{balance_step4:,.2f} - ₹{summary_data['repayment_ak_to_aa']:,.2f} = ₹{balance_step5:,.2f}`")
-    
-    st.markdown(f"**Final Balance:** A positive final number (`₹{balance:,.2f}`) means **AA owes AK**. A negative number would mean AK owes AA.")
-
-
+    # --- DETAILED LOGIC RESTORED HERE ---
     with st.expander("Show Detailed Transaction-by-Transaction Log"):
         running_balance = 0.0
-        st.write("*(Balance from AK's perspective: Positive means AA owes AK)*")
-        log = f"**Starting Balance: ₹0.00**\n\n---\n"
+        st.markdown(f"**Initial Balance:** `₹{running_balance:,.2f}`")
+        st.markdown("---")
         
-        for _, row in transactions_df.iterrows():
-            amount = row['Amount']
-            paid_by = row['Paid by']
-            trans_type = row['Type']
-            desc = row['Transaction']
+        for index, row in transactions_df.iterrows():
+            st.markdown(f"**Transaction {index + 1}:** *{row['Transaction']}* (`₹{row['Amount']:,.2f}`)")
             
-            old_balance = running_balance
-            logic = ""
+            logic_text = ""
+            balance_change = 0.0
+
+            if row['Type'] == 'Shared Expense':
+                share = row['Amount'] / 2.0
+                if row['Paid by'] == 'AK':
+                    balance_change = share
+                    logic_text = f"Shared cost paid by AK. AK's balance increases by their half: `+₹{share:,.2f}`."
+                else: # Paid by AA
+                    balance_change = -share
+                    logic_text = f"Shared cost paid by AA. AK's balance decreases by their half: `-₹{share:,.2f}`."
+            elif row['Type'] == 'For AA only' and row['Paid by'] == 'AK':
+                balance_change = row['Amount']
+                logic_text = f"AK paid for AA. AK's balance increases by the full amount: `+₹{row['Amount']:,.2f}`."
+            elif row['Type'] == 'For AK only' and row['Paid by'] == 'AA':
+                balance_change = -row['Amount']
+                logic_text = f"AA paid for AK. AK's balance decreases by the full amount: `-₹{row['Amount']:,.2f}`."
+            elif row['Type'] == 'Repayment from AA to AK':
+                balance_change = row['Amount']
+                logic_text = f"AA repaid AK. AK's balance increases: `+₹{row['Amount']:,.2f}`."
+            elif row['Type'] == 'Repayment from AK to AA':
+                balance_change = -row['Amount']
+                logic_text = f"AK repaid AA. AK's balance decreases: `-₹{row['Amount']:,.2f}`."
             
-            if trans_type == 'Shared Expense':
-                change = amount / 2
-                if paid_by == 'AK':
-                    running_balance += change
-                    logic = f"AK paid. AK's balance increases by half. `+{change:,.2f}`"
-                else:
-                    running_balance -= change
-                    logic = f"AA paid. AK's balance decreases by half. `-{change:,.2f}`"
-            elif trans_type == 'For AA only' and paid_by == 'AK':
-                running_balance += amount
-                logic = f"AK paid for AA. AK's balance increases. `+{amount:,.2f}`"
-            elif trans_type == 'For AK only' and paid_by == 'AA':
-                running_balance -= amount
-                logic = f"AA paid for AK. AK's balance decreases. `-{amount:,.2f}`"
-            elif trans_type == 'Repayment from AA to AK':
-                running_balance -= amount
-                logic = f"AA repaid AK. AK's balance decreases. `-{amount:,.2f}`"
-            elif trans_type == 'Repayment from AK to AA':
-                running_balance += amount # This assumes repayment increases AK's net contribution
-                logic = f"AK repaid AA. AK's balance increases. `+{amount:,.2f}`"
-            
-            if logic:
-                log += f"**Transaction**: *{desc}* (₹{amount:,.2f})\n\n"
-                log += f"- **Logic**: {logic}\n"
-                log += f"- **Balance**: `₹{old_balance:,.2f} -> ₹{running_balance:,.2f}`\n\n---\n"
-        
-        st.markdown(log)
+            st.markdown(f"> *{logic_text}*")
+            new_running_balance = running_balance + balance_change
+            st.markdown(f"> **New Balance:** `{running_balance:,.2f} + ({balance_change:,.2f}) =` **`₹{new_running_balance:,.2f}`**")
+            running_balance = new_running_balance
+            st.markdown("---")
+
 
 # --- Data Entry in Sidebar ---
 with st.sidebar:
@@ -325,29 +320,16 @@ with st.sidebar:
         amount = st.number_input("Amount (₹)", min_value=0.01, format="%.2f")
         transaction_date = st.date_input("Date of Transaction", datetime.date.today())
         paid_by = st.selectbox("Paid by", ["AK", "AA"], index=0)
-        trans_type_options = [
-            'Shared Expense', 
-            'For AK only', 
-            'For AA only', 
-            'Repayment from AK to AA', 
-            'Repayment from AA to AK'
-        ]
-        trans_type = st.selectbox("Type", trans_type_options, index=0)
+        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AA to AK'], index=0)
         
-        submitted = st.form_submit_button("Add Transaction")
-
-        if submitted:
+        if st.form_submit_button("Add Transaction"):
             if not transaction or amount <= 0:
                 st.warning("Please fill in all fields with a valid amount.")
             else:
                 new_entry = pd.DataFrame([{
-                    "Transaction": transaction,
-                    "Amount": amount,
-                    "Type": trans_type,
-                    "Paid by": paid_by,
-                    "Date of Transaction": transaction_date,
-                    "Entered by": st.session_state["user"],
-                    "Timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "Transaction": transaction, "Amount": amount, "Type": trans_type,
+                    "Paid by": paid_by, "Date of Transaction": transaction_date.isoformat(),
+                    "Entered by": st.session_state["user"], "Timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "Location": get_location()
                 }])
                 
@@ -359,73 +341,74 @@ with st.sidebar:
 st.markdown("---")
 st.header("Transaction History")
 
-# --- Filters for the History View ---
-filt_col1, filt_col2, filt_col3 = st.columns([2, 2, 1])
-with filt_col1:
+# --- FILTERING CONTROLS ADDED HERE ---
+filtered_df = transactions_df.copy()
+st.subheader("Filter Transactions")
+filter_cols = st.columns([1, 1, 2])
+
+with filter_cols[0]:
     paid_by_filter = st.multiselect(
-        "Filter by who paid:",
-        options=transactions_df['Paid by'].unique(),
-        default=transactions_df['Paid by'].unique()
+        "Paid by",
+        options=transactions_df["Paid by"].unique(),
+        default=transactions_df["Paid by"].unique()
     )
-with filt_col2:
-    if not transactions_df.empty and pd.api.types.is_datetime64_any_dtype(pd.to_datetime(transactions_df['Date of Transaction'], errors='coerce')):
-        min_date = transactions_df['Date of Transaction'].min()
-        max_date = transactions_df['Date of Transaction'].max()
-        if min_date and max_date and isinstance(min_date, datetime.date) and isinstance(max_date, datetime.date):
-             date_range = st.date_input(
-                "Filter by transaction date:",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
-            )
-        else:
-            date_range = None
+
+with filter_cols[1]:
+    type_filter = st.multiselect(
+        "Type",
+        options=transactions_df["Type"].unique(),
+        default=transactions_df["Type"].unique()
+    )
+
+with filter_cols[2]:
+    if not transactions_df.empty:
+        min_date = transactions_df["Date of Transaction"].min()
+        max_date = transactions_df["Date of Transaction"].max()
+        date_range = st.date_input(
+            "Select date range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date
+        )
     else:
-        date_range = None
-        
+        date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
+
+
 # Apply filters
-filtered_df = transactions_df[transactions_df['Paid by'].isin(paid_by_filter)]
-if date_range and len(date_range) == 2:
-    start_date, end_date = date_range
+if paid_by_filter:
+    filtered_df = filtered_df[filtered_df["Paid by"].isin(paid_by_filter)]
+if type_filter:
+    filtered_df = filtered_df[filtered_df["Type"].isin(type_filter)]
+if len(date_range) == 2:
     filtered_df = filtered_df[
-        (filtered_df['Date of Transaction'] >= start_date) & 
-        (filtered_df['Date of Transaction'] <= end_date)
+        (filtered_df["Date of Transaction"] >= date_range[0]) &
+        (filtered_df["Date of Transaction"] <= date_range[1])
     ]
 
+# Display the filtered dataframe as a read-only table
+st.dataframe(filtered_df, use_container_width=True)
 
-st.info("You can edit or delete entries directly in the table below. Changes are saved automatically.")
+st.markdown("---")
+st.header("Edit Full Transaction History")
+st.info("You can edit, add, or delete entries directly in the table below. This table shows ALL transactions and is not affected by the filters above. Changes are saved automatically.")
 
 # --- Interactive Data Editor ---
 edited_df = st.data_editor(
-    filtered_df,
+    transactions_df,
     num_rows="dynamic",
     use_container_width=True,
     column_config={
-        "Amount": st.column_config.NumberColumn(
-            "Amount (₹)",
-            format="₹%.2f",
-        ),
-        "Date of Transaction": st.column_config.DateColumn(
-            "Transaction Date",
-            format="D MMM YYYY",
-        ),
-        "Timestamp": st.column_config.DatetimeColumn(
-            "Entry Timestamp",
-            format="D MMM YYYY, h:mm a",
-        ),
+        "Amount": st.column_config.NumberColumn("Amount (₹)", format="₹%.2f"),
+        "Date of Transaction": st.column_config.DateColumn("Transaction Date", format="D MMM YYYY"),
+        "Timestamp": st.column_config.DatetimeColumn("Entry Timestamp", format="D MMM YYYY, h:mm a"),
     },
     key="data_editor"
 )
 
-# --- Save edits back to the CSV ---
-# This part is tricky with filtering. The logic needs to update the original dataframe.
-if not filtered_df.equals(edited_df):
-    # Update the original dataframe with changes from the edited one
-    transactions_df.update(edited_df)
-    # Handle deleted rows
-    deleted_indices = filtered_df.index.difference(edited_df.index)
-    transactions_df = transactions_df.drop(index=deleted_indices)
-    
-    save_data(transactions_df)
+# --- Save edits back to Google Sheets ---
+# Check if the dataframe from the editor is different from the original one
+if not transactions_df.equals(edited_df):
+    save_data(edited_df)
     st.toast("Changes saved!", icon="✅")
+    # A rerun is needed here to reflect the saved changes in calculations
     st.rerun()
