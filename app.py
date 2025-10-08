@@ -13,7 +13,7 @@ import requests
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="AK & AA Shared Expense Tracker",
+    page_title="Ak & Aa Shared Expense Tracker (AASET)",
     page_icon="💸",
     layout="wide"
 )
