@@ -106,13 +106,16 @@ def load_data(_conn):
         ])
 
 def save_data(_conn, df):
-    """Saves the DataFrame to the Google Sheet by overwriting it."""
+    """Saves the DataFrame to the Google Sheet using the correct .update() method."""
     try:
-        # Convert date column to string to prevent serialization issues with gsheets
+        # Convert date/time columns to strings for compatibility
         df_copy = df.copy()
         df_copy['Date of Transaction'] = pd.to_datetime(df_copy['Date of Transaction']).dt.strftime('%Y-%m-%d')
         df_copy['Timestamp'] = pd.to_datetime(df_copy['Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        _conn.write(data=df_copy)
+        
+        # The .update() method is the correct way to write data with this library.
+        # It clears the sheet and writes the new dataframe in one operation.
+        _conn.update(worksheet="Sheet1", data=df_copy)
         st.cache_data.clear() # Clear cache after writing
     except Exception as e:
         st.error(f"Failed to save data to Google Sheets: {e}")
