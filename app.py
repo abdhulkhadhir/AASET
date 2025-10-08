@@ -10,7 +10,6 @@ import pandas as pd
 import datetime
 import requests
 from streamlit_gsheets import GSheetsConnection
-import gspread
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -70,12 +69,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- GOOGLE SHEETS CONNECTION (Using streamlit_gsheets as requested) ---
+# --- GOOGLE SHEETS CONNECTION ---
 try:
-    # Connect using the name "gsheets" which maps to [connections.gsheets] in secrets
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` is configured correctly under `[connections.gsheets]`.")
+    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` file is configured correctly under `[connections.gsheets]` and includes the spreadsheet URL.")
     st.error(f"Error details: {e}")
     st.stop()
 
@@ -89,57 +87,35 @@ def get_location():
     except requests.RequestException:
         return "Location N/A"
 
-@st.cache_data(ttl=30) # Cache data for 30 seconds
-def load_data():
+@st.cache_data(ttl=60)
+def load_data(_conn):
     """Loads and cleans transaction data from the Google Sheet."""
     try:
-        df = conn.read(worksheet="Sheet1", usecols=list(range(8)))
+        df = _conn.read(usecols=list(range(8)), ttl=60) # Use TTL here for caching
         df.dropna(how="all", inplace=True)
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
-        # Handle potential errors if timestamp or date columns are malformed
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-        df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce')
-        # Sort by transaction date to ensure chronological calculations
+        df['Date of Transaction'] = pd.to_datetime(df['Date of Transaction'], errors='coerce').dt.date
         df = df.sort_values(by="Date of Transaction").reset_index(drop=True)
         return df
-    except gspread.exceptions.WorksheetNotFound:
-         st.error("Worksheet 'Sheet1' not found. Please ensure your Google Sheet has a sheet with this exact name.")
     except Exception as e:
         st.error(f"Failed to load data from Google Sheets: {e}")
-    
-    # Return an empty dataframe with correct columns if loading fails
-    return pd.DataFrame(columns=[
-        'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 
-        'Entered by', 'Timestamp', 'Location'
-    ])
+        return pd.DataFrame(columns=[
+            'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 
+            'Entered by', 'Timestamp', 'Location'
+        ])
 
-def save_data_on_edit(df):
-    """Saves the entire DataFrame to the Google Sheet, overwriting it. Used by the data editor."""
+def save_data(_conn, df):
+    """Saves the DataFrame to the Google Sheet by overwriting it."""
     try:
-        st.cache_data.clear()
-        # The .update() method may not be available on all connection objects,
-        # so we get the underlying worksheet to perform a robust clear and write.
-        spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-        worksheet_name = st.secrets["connections"]["gsheets"]["worksheet"]
-        worksheet = conn.client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
-        
-        worksheet.clear()
-        worksheet.update([df.columns.values.tolist()] + df.values.tolist())
+        # Convert date column to string to prevent serialization issues with gsheets
+        df_copy = df.copy()
+        df_copy['Date of Transaction'] = pd.to_datetime(df_copy['Date of Transaction']).dt.strftime('%Y-%m-%d')
+        df_copy['Timestamp'] = pd.to_datetime(df_copy['Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        _conn.write(data=df_copy)
+        st.cache_data.clear() # Clear cache after writing
     except Exception as e:
-        st.error(f"Failed to save changes to Google Sheets: {e}")
-
-def append_new_transaction(new_entry_df):
-    """Appends a new row to the Google Sheet. More efficient for single additions."""
-    try:
-        spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-        worksheet_name = st.secrets["connections"]["gsheets"]["worksheet"]
-        worksheet = conn.client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
-        
-        worksheet.append_rows(new_entry_df.values.tolist(), value_input_option='USER_ENTERED')
-        st.cache_data.clear() # Clear cache to force a reload on the next run
-    except Exception as e:
-        st.error(f"Failed to add new transaction to Google Sheets: {e}")
-
+        st.error(f"Failed to save data to Google Sheets: {e}")
 
 # --- AUTHENTICATION ---
 def check_password():
@@ -171,6 +147,7 @@ def check_password():
             st.error(f"An error occurred during login: {e}")
             st.session_state["user_logged_in"] = False
 
+
     if st.session_state.get("user_logged_in", False):
         return True
 
@@ -181,18 +158,14 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- Display Logout Button ---
 st.sidebar.write(f"Welcome, **{st.session_state['user']}**!")
 if st.sidebar.button("Logout"):
     st.session_state["user_logged_in"] = False
     st.rerun()
 
-# --- Load Data ---
-transactions_df = load_data()
-# Convert date column to date objects for filtering, handling NaT (Not a Time) values
-transactions_df['Date of Transaction'] = pd.to_datetime(transactions_df['Date of Transaction']).dt.date
+transactions_df = load_data(conn)
 
-# --- BALANCE CALCULATION ---
+# --- BALANCE CALCULATION (CLEANED UP) ---
 def calculate_balance_and_summary(df):
     """Calculates the balance and a summary dictionary for display."""
     if df.empty:
@@ -214,15 +187,23 @@ def calculate_balance_and_summary(df):
         'repayment_aa_to_ak': df[df['Type'] == 'Repayment from AA to AK']['Amount'].sum(),
     }
     
-    balance = 0.0
+    # Balance from AK's perspective: Positive means AA owes AK.
     ak_share = summary['shared_expenses'] / 2.0 if summary['shared_expenses'] > 0 else 0.0
-    ak_overpayment_on_shared = summary['shared_paid_by_ak'] - ak_share
     
-    balance += ak_overpayment_on_shared
+    # Start with what AK is owed (or owes) from shared costs
+    balance = summary['shared_paid_by_ak'] - ak_share
+    
+    # Add what AK is owed for paying for AA's things
     balance += summary['aa_only_paid_by_ak']
+    
+    # Subtract what AK owes AA for paying for AK's things
     balance -= summary['ak_only_paid_by_aa']
-    balance -= summary['repayment_ak_to_aa']
-    balance += summary['repayment_aa_to_ak']
+    
+    # When AK repays AA, AK's debt to AA is reduced. This moves the balance in AK's favor (more positive).
+    balance += summary['repayment_ak_to_aa'] 
+    
+    # When AA repays AK, AA's debt to AK is reduced. This moves the balance against AK's favor (more negative).
+    balance -= summary['repayment_aa_to_ak']
 
     return balance, summary
 
@@ -231,7 +212,6 @@ st.title("💸 AK & AA Shared Expense Tracker")
 st.markdown("A persistent expense tracker powered by Google Sheets.")
 st.markdown("---")
 
-# --- Dashboard Metrics ---
 col1, col2, col3 = st.columns(3)
 total_shared = transactions_df['Amount'][transactions_df['Type'] == 'Shared Expense'].sum()
 total_paid_by_user = transactions_df['Amount'][transactions_df['Paid by'] == st.session_state['user']].sum()
@@ -241,7 +221,6 @@ col3.metric("Total Transactions", f"{len(transactions_df)}")
 
 st.markdown("---")
 
-# --- Net Balance Display ---
 balance, summary_data = calculate_balance_and_summary(transactions_df)
 
 _, center_col, _ = st.columns([1, 2, 1])
@@ -256,7 +235,6 @@ with center_col:
     st.markdown(f'<div class="balance-card {card_class}"><h3>{title}</h3><p class="amount">{amount_display}</p></div>', unsafe_allow_html=True)
 
 
-# --- Calculation Transparency ---
 with st.expander("Show Calculation Breakdown"):
     st.subheader("High-Level Summary (from AK's perspective)")
     
@@ -266,8 +244,7 @@ with st.expander("Show Calculation Breakdown"):
     st.markdown("##### 1. Shared Costs Analysis")
     st.markdown(f"- **Total Shared Expenses:** `₹{summary_data['shared_expenses']:,.2f}`\n"
                 f"- **Each Person's Share (50%):** `₹{ak_share:,.2f}`\n"
-                f"- **Amount AK Paid for Shared Costs:** `₹{summary_data['shared_paid_by_ak']:,.2f}`\n"
-                f"- **Amount AA Paid for Shared Costs:** `₹{summary_data['shared_paid_by_aa']:,.2f}`")
+                f"- **Amount AK Paid for Shared Costs:** `₹{summary_data['shared_paid_by_ak']:,.2f}`")
     if ak_overpayment > 0:
         st.success(f"Logic: AK paid `₹{ak_overpayment:,.2f}` more than their share. This is a credit for AK.")
     else:
@@ -277,16 +254,16 @@ with st.expander("Show Calculation Breakdown"):
     st.markdown("##### 2. Individual Costs & Repayments")
     st.markdown(f"- **Costs for AA Only (Paid by AK):** `₹{summary_data['aa_only_paid_by_ak']:,.2f}` (Credit for AK)\n"
                 f"- **Costs for AK Only (Paid by AA):** `₹{summary_data['ak_only_paid_by_aa']:,.2f}` (Debit for AK)\n"
-                f"- **Repayments from AA to AK:** `₹{summary_data['repayment_aa_to_ak']:,.2f}` (Credit for AK)\n"
-                f"- **Repayments from AK to AA:** `₹{summary_data['repayment_ak_to_aa']:,.2f}` (Debit for AK)")
+                f"- **Repayments from AA to AK:** `₹{summary_data['repayment_aa_to_ak']:,.2f}` (Reduces AA's debt to AK)\n"
+                f"- **Repayments from AK to AA:** `₹{summary_data['repayment_ak_to_aa']:,.2f}` (Reduces AK's debt to AA)")
     st.markdown("---")
 
     st.markdown("##### 3. Final Calculation")
     st.markdown(f"**Net from Shared Costs:** `₹{ak_overpayment:,.2f}`\n"
                 f"**+ Costs AK paid for AA:** `+ ₹{summary_data['aa_only_paid_by_ak']:,.2f}`\n"
                 f"**- Costs AA paid for AK:** `- ₹{summary_data['ak_only_paid_by_aa']:,.2f}`\n"
-                f"**+ Repayments from AA:** `+ ₹{summary_data['repayment_aa_to_ak']:,.2f}`\n"
-                f"**- Repayments from AK:** `- ₹{summary_data['repayment_ak_to_aa']:,.2f}`\n"
+                f"**+ Repayments from AK:** `+ ₹{summary_data['repayment_ak_to_aa']:,.2f}`\n"
+                f"**- Repayments from AA:** `- ₹{summary_data['repayment_aa_to_ak']:,.2f}`\n"
                 f"**= FINAL BALANCE:** `₹{balance:,.2f}`")
     st.info("A positive final balance means AA owes AK. A negative balance means AK owes AA.")
 
@@ -305,22 +282,22 @@ with st.expander("Show Calculation Breakdown"):
                 share = row['Amount'] / 2.0
                 if row['Paid by'] == 'AK':
                     balance_change = share
-                    logic_text = f"Shared cost paid by AK. AK's balance increases by their half: `+₹{share:,.2f}`."
+                    logic_text = f"Shared cost paid by AK. Balance increases (AA owes more): `+₹{share:,.2f}`."
                 else: # Paid by AA
                     balance_change = -share
-                    logic_text = f"Shared cost paid by AA. AK's balance decreases by their half: `-₹{share:,.2f}`."
+                    logic_text = f"Shared cost paid by AA. Balance decreases (AK owes more): `-₹{share:,.2f}`."
             elif row['Type'] == 'For AA only' and row['Paid by'] == 'AK':
                 balance_change = row['Amount']
-                logic_text = f"AK paid for AA. AK's balance increases by the full amount: `+₹{row['Amount']:,.2f}`."
+                logic_text = f"AK paid for AA. Balance increases: `+₹{row['Amount']:,.2f}`."
             elif row['Type'] == 'For AK only' and row['Paid by'] == 'AA':
                 balance_change = -row['Amount']
-                logic_text = f"AA paid for AK. AK's balance decreases by the full amount: `-₹{row['Amount']:,.2f}`."
+                logic_text = f"AA paid for AK. Balance decreases: `-₹{row['Amount']:,.2f}`."
             elif row['Type'] == 'Repayment from AA to AK':
-                balance_change = row['Amount']
-                logic_text = f"AA repaid AK. AK's balance increases: `+₹{row['Amount']:,.2f}`."
-            elif row['Type'] == 'Repayment from AK to AA':
                 balance_change = -row['Amount']
-                logic_text = f"AK repaid AA. AK's balance decreases: `-₹{row['Amount']:,.2f}`."
+                logic_text = f"AA repaid AK. AA's debt reduces. Balance decreases: `-₹{row['Amount']:,.2f}`."
+            elif row['Type'] == 'Repayment from AK to AA':
+                balance_change = row['Amount']
+                logic_text = f"AK repaid AA. AK's debt reduces. Balance increases: `+₹{row['Amount']:,.2f}`."
             
             st.markdown(f"> *{logic_text}*")
             new_running_balance = running_balance + balance_change
@@ -329,7 +306,6 @@ with st.expander("Show Calculation Breakdown"):
             st.markdown("---")
 
 
-# --- Data Entry in Sidebar ---
 with st.sidebar:
     st.header("Add New Transaction")
     with st.form("new_transaction_form", clear_on_submit=True):
@@ -337,7 +313,7 @@ with st.sidebar:
         amount = st.number_input("Amount (₹)", min_value=0.01, format="%.2f")
         transaction_date = st.date_input("Date of Transaction", datetime.date.today())
         paid_by = st.selectbox("Paid by", ["AK", "AA"], index=0)
-        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AK to AK'], index=0)
+        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AA to AK'], index=0)
         
         if st.form_submit_button("Add Transaction"):
             if not transaction or amount <= 0:
@@ -345,19 +321,19 @@ with st.sidebar:
             else:
                 new_entry = pd.DataFrame([{
                     "Transaction": transaction, "Amount": amount, "Type": trans_type,
-                    "Paid by": paid_by, "Date of Transaction": transaction_date.isoformat(),
-                    "Entered by": st.session_state["user"], "Timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "Paid by": paid_by, "Date of Transaction": transaction_date,
+                    "Entered by": st.session_state["user"], "Timestamp": datetime.datetime.now(datetime.timezone.utc),
                     "Location": get_location()
                 }])
                 
-                append_new_transaction(new_entry)
+                updated_df = pd.concat([transactions_df, new_entry], ignore_index=True)
+                save_data(conn, updated_df)
                 st.success("Transaction added!")
                 st.rerun()
 
 st.markdown("---")
 st.header("Transaction History")
 
-# --- Filtering Controls ---
 filtered_df = transactions_df.copy()
 st.subheader("Filter Transactions")
 filter_cols = st.columns([1, 1, 2])
@@ -377,31 +353,26 @@ with filter_cols[1]:
     )
 
 with filter_cols[2]:
-    # Ensure dataframe is not empty and date column exists before finding min/max
-    if not transactions_df.empty and 'Date of Transaction' in transactions_df.columns:
-        valid_dates = transactions_df['Date of Transaction'].dropna()
-        if not valid_dates.empty:
-            min_date = valid_dates.min()
-            max_date = valid_dates.max()
-            date_range = st.date_input(
-                "Select date range",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date
-            )
-        else:
-            date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
+    if not transactions_df.empty and pd.api.types.is_datetime64_any_dtype(transactions_df["Date of Transaction"]):
+        min_date = transactions_df["Date of Transaction"].min()
+        max_date = transactions_df["Date of Transaction"].max()
+        if min_date > max_date: # Handle case where there's only one date
+             min_date = max_date
+        date_range = st.date_input(
+            "Select date range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date
+        )
     else:
         date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
 
 
-# Apply filters
 if paid_by_filter:
     filtered_df = filtered_df[filtered_df["Paid by"].isin(paid_by_filter)]
 if type_filter:
     filtered_df = filtered_df[filtered_df["Type"].isin(type_filter)]
-if len(date_range) == 2 and not filtered_df.empty:
-    # Safely convert to date objects for comparison
+if len(date_range) == 2:
     filtered_df = filtered_df[
         (filtered_df["Date of Transaction"] >= date_range[0]) &
         (filtered_df["Date of Transaction"] <= date_range[1])
@@ -413,7 +384,6 @@ st.markdown("---")
 st.header("Edit Full Transaction History")
 st.info("You can edit, add, or delete entries directly in the table below. This table shows ALL transactions and is not affected by the filters above. Changes are saved automatically.")
 
-# --- Interactive Data Editor ---
 edited_df = st.data_editor(
     transactions_df,
     num_rows="dynamic",
@@ -426,8 +396,7 @@ edited_df = st.data_editor(
     key="data_editor"
 )
 
-# --- Save edits back to Google Sheets ---
 if not transactions_df.equals(edited_df):
-    save_data_on_edit(edited_df)
+    save_data(conn, edited_df)
     st.toast("Changes saved!", icon="✅")
     st.rerun()
