@@ -13,7 +13,7 @@ import requests
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="Ak & Aa Shared Expense Tracker (AASET)",
+    page_title="Ak & Aa Shared Expense Tracker (AKAASET)",
     page_icon="💸",
     layout="wide"
 )
@@ -187,7 +187,7 @@ def calculate_balance_and_summary(df):
 
 
 # --- UI DISPLAY ---
-st.title("💸 AK & AA Shared Expense Tracker")
+st.title("💸 AK & AA Shared Expense Tracker (AKAASET)")
 st.markdown("---")
 
 # --- Dashboard Metrics ---
