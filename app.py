@@ -108,7 +108,7 @@ except Exception as e:
 # cookie_expiry_days = 1
 
 def build_authenticator_from_secrets():
-    # Validate presence
+    """Builds a secure authenticator from Streamlit secrets using streamlit-authenticator."""
     try:
         user_map = dict(st.secrets["credentials"]["users"])
     except Exception:
@@ -127,20 +127,20 @@ def build_authenticator_from_secrets():
         st.error("Invalid or missing `[auth]` section in secrets.toml. Please add `cookie_name` and `cookie_key`.")
         st.stop()
 
-    # Build lists for Hasher
-    usernames = list(user_map.keys())
-    passwords = [str(user_map[u]) for u in usernames]
-
-    # Hash the passwords at runtime so stored plain passwords still work.
-    # If you're already storing hashed passwords, this will double-hash them; however
-    # streamlit-authenticator's Hasher.generate is intended for plain passwords.
-    hashed_passwords = stauth.Hasher(passwords).generate()
-
-    # Build credentials structure expected by streamlit-authenticator
+    # prepare credentials
     credentials = {"usernames": {}}
-    for uname, hp in zip(usernames, hashed_passwords):
-        # Use username as display name by default
-        credentials["usernames"][uname] = {"name": uname, "password": hp}
+    for username, pwd in user_map.items():
+        pwd = str(pwd).strip()
+        if pwd.startswith("$2b$"):  # already bcrypt-hashed
+            hashed_pwd = pwd
+        else:
+            try:
+                from streamlit_authenticator import Hasher
+                hashed_pwd = Hasher([pwd]).generate()[0]
+            except Exception:
+                import bcrypt
+                hashed_pwd = bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        credentials["usernames"][username] = {"name": username, "password": hashed_pwd}
 
     authenticator = stauth.Authenticate(
         credentials,
