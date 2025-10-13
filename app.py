@@ -254,7 +254,7 @@ def df_equivalent(a: pd.DataFrame, b: pd.DataFrame) -> bool:
         return False
 
 # --- LOGIN UI using streamlit-authenticator ---
-name, authentication_status, username = authenticator.login("Login", "main")
+name, authentication_status, username = authenticator.login(location="main", fields={"Form name": "Login"})
 
 if authentication_status is False:
     st.error("Username/password is incorrect")
