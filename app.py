@@ -254,14 +254,19 @@ def df_equivalent(a: pd.DataFrame, b: pd.DataFrame) -> bool:
         return False
 
 # --- LOGIN UI using streamlit-authenticator ---
-name, authentication_status, username = authenticator.login(location="main", max_login_attempts=3)
+auth_result = authenticator.login(location="main")
 
-if authentication_status is False:
-    st.error("Username/password is incorrect")
-    st.stop()
-if authentication_status is None:
-    st.info("Please enter your credentials to continue")
-    st.stop()
+if auth_result and auth_result.get("authenticated"):
+    authenticator.logout("Logout", "sidebar")
+    username = auth_result["username"]
+    name = auth_result.get("name", username)
+    st.sidebar.success(f"Welcome, {name} 👋")
+
+elif auth_result and not auth_result.get("authenticated"):
+    st.error("Invalid username or password")
+    
+else:
+    st.warning("Please log in to continue")
 
 # User successfully logged in; username is the key we used in credentials (AK / AA)
 current_user = username  # "AK" or "AA"
