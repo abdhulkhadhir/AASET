@@ -5,6 +5,7 @@ Created on Wed Oct  8 12:14:00 2025
 @author: seyedhyd
 """
 
+# app.py
 import streamlit as st
 import pandas as pd
 import datetime
@@ -12,168 +13,131 @@ import requests
 import time
 import altair as alt
 
+# Google Sheets connection
 from streamlit_gsheets import GSheetsConnection
 
-# streamlit-authenticator
+# Attempt to import streamlit-authenticator (fail with clear message if missing)
 try:
     import streamlit_authenticator as stauth
 except Exception as e:
     st.error("Missing dependency: streamlit-authenticator. Install with `pip install streamlit-authenticator`.")
     st.stop()
 
-# --- CONFIGURATION ---
-st.set_page_config(
-    page_title="AK & AA Shared Expense Tracker",
-    page_icon="💸",
-    layout="wide"
-)
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AK & AA Shared Expense Tracker", page_icon="💸", layout="wide")
 
-# How long authentication cookies last (days) -- read from secrets
-DEFAULT_COOKIE_DAYS = 1
-
-# --- STYLING ---
+# --- STYLING (kept from your original) ---
 st.markdown("""
 <style>
-    /* Main container styling */
-    .main .block-container {
-        padding-top: 2rem;
-    }
-    /* Custom card for balance display */
+    .main .block-container { padding-top: 2rem; }
     .balance-card {
-        background-color: #f0f2f6;
-        border-radius: 15px;
-        padding: 25px;
-        text-align: center;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        border: 1px solid #e0e0e0;
+        background-color: #f0f2f6; border-radius: 15px; padding: 25px;
+        text-align: center; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border: 1px solid #e0e0e0;
         transition: transform 0.16s ease, box-shadow 0.2s ease;
     }
-    .balance-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 6px 12px rgba(0,0,0,0.12);
-    }
-    .balance-card h3 {
-        margin: 0;
-        color: #555;
-        font-size: 1.2rem;
-        font-weight: 600;
-    }
-    .balance-card .amount {
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin: 10px 0;
-    }
-    .balance-card.positive {
-        background-color: #e6ffed;
-        border-color: #b7e4c7;
-    }
-    .balance-card.positive .amount {
-        color: #2d6a4f;
-    }
-    .balance-card.negative {
-        background-color: #fff0f0;
-        border-color: #ffb3b3;
-    }
-    .balance-card.negative .amount {
-        color: #c9184a;
-    }
-     .balance-card.neutral {
-        background-color: #e9f5ff;
-        border-color: #a3d5ff;
-    }
-    .balance-card.neutral .amount {
-        color: #005f73;
-    }
+    .balance-card:hover { transform: translateY(-4px); box-shadow: 0 6px 12px rgba(0,0,0,0.12); }
+    .balance-card h3 { margin: 0; color: #555; font-size: 1.2rem; font-weight: 600; }
+    .balance-card .amount { font-size: 2.5rem; font-weight: 700; margin: 10px 0; }
+    .balance-card.positive { background-color: #e6ffed; border-color: #b7e4c7; }
+    .balance-card.positive .amount { color: #2d6a4f; }
+    .balance-card.negative { background-color: #fff0f0; border-color: #ffb3b3; }
+    .balance-card.negative .amount { color: #c9184a; }
+    .balance-card.neutral { background-color: #e9f5ff; border-color: #a3d5ff; }
+    .balance-card.neutral .amount { color: #005f73; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- GOOGLE SHEETS CONNECTION ---
+# --- GOOGLE SHEETS CONNECTION: attempt to create connection object ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` file is configured correctly under `[connections.gsheets]` and includes the spreadsheet URL.")
-    st.error(f"Error details: {e}")
+    st.error("Failed to connect to Google Sheets. Please ensure your `secrets.toml` has a valid `[connections.gsheets]` entry.")
+    st.error(f"Connection error: {e}")
     st.stop()
 
-# --- AUTHENTICATION SETUP USING streamlit-authenticator ---
-#
-# Required secrets in secrets.toml:
-# [credentials.users]
-# AK = "AK_plain_or_hashed_password"
-# AA = "AA_plain_or_hashed_password"
-#
-# [auth]
-# cookie_name = "ak_aa_tracker"
-# cookie_key = "some_long_random_secret_key"
-# cookie_expiry_days = 1
+# --- Authentication builder (robust across versions) ---
+DEFAULT_COOKIE_DAYS = 1
 
 def build_authenticator_from_secrets():
-    """Builds a secure authenticator from Streamlit secrets using streamlit-authenticator."""
+    """
+    Build a streamlit-authenticator Authenticate object from st.secrets.
+    Expects:
+      st.secrets['credentials']['users'] -> mapping username -> password (plain or bcrypt-hashed)
+      st.secrets['auth'] -> {cookie_name, cookie_key, cookie_expiry_days (optional)}
+    """
+    # Read users
     try:
         user_map = dict(st.secrets["credentials"]["users"])
+        if not user_map:
+            raise KeyError
     except Exception:
-        st.error("st.secrets missing `[credentials.users]`. Please add AK and AA credentials under `[credentials.users]` in secrets.toml.")
+        st.error("Missing credentials in secrets.toml. Add `[credentials.users]` with AK and AA entries.")
         st.stop()
 
+    # Read auth config (cookie)
     try:
         auth_conf = st.secrets.get("auth", {})
-        cookie_name = auth_conf.get("cookie_name")
-        cookie_key = auth_conf.get("cookie_key")
+        cookie_name = auth_conf.get("cookie_name", None)
+        cookie_key = auth_conf.get("cookie_key", None)
         cookie_expiry_days = int(auth_conf.get("cookie_expiry_days", DEFAULT_COOKIE_DAYS))
         if not cookie_name or not cookie_key:
-            st.error("st.secrets missing `[auth].cookie_name` or `[auth].cookie_key`. Please add them to secrets.toml.")
-            st.stop()
+            raise KeyError
     except Exception:
-        st.error("Invalid or missing `[auth]` section in secrets.toml. Please add `cookie_name` and `cookie_key`.")
+        st.error("Missing auth config in secrets.toml. Add `[auth]` with `cookie_name` and `cookie_key`.")
         st.stop()
 
-    # prepare credentials
+    # Prepare credentials structure
     credentials = {"usernames": {}}
-    for username, pwd in user_map.items():
+    for uname, pwd in user_map.items():
         pwd = str(pwd).strip()
-        if pwd.startswith("$2b$"):  # already bcrypt-hashed
+        # If already bcrypt hashed (common prefix), reuse it. Otherwise hash.
+        if pwd.startswith("$2b$") or pwd.startswith("$2a$"):
             hashed_pwd = pwd
         else:
+            # Try using streamlit_authenticator.Hasher if available
             try:
-                from streamlit_authenticator import Hasher
-                hashed_pwd = Hasher([pwd]).generate()[0]
+                # Newer versions use Hasher([...]).generate()
+                hashed_pwd = stauth.Hasher([pwd]).generate()[0]
             except Exception:
-                import bcrypt
-                hashed_pwd = bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        credentials["usernames"][username] = {"name": username, "password": hashed_pwd}
+                # fallback to bcrypt directly
+                try:
+                    import bcrypt
+                    hashed_pwd = bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                except Exception:
+                    st.error("Failed to hash passwords. Ensure `bcrypt` is available or store hashed passwords in secrets.")
+                    st.stop()
+        credentials["usernames"][uname] = {"name": uname, "password": hashed_pwd}
 
+    # Create the Authenticate object
     authenticator = stauth.Authenticate(
-        credentials,
-        cookie_name,
-        cookie_key,
-        cookie_expiry_days
+        credentials=credentials,
+        cookie_name=cookie_name,
+        key=cookie_key,
+        cookie_expiry_days=cookie_expiry_days
     )
     return authenticator
 
+# Build authenticator
 authenticator = build_authenticator_from_secrets()
 
-# --- HELPERS ---
+# --- Helpers: location, data load/save, calculations ---
 def get_location():
-    """Fetches the user's estimated location based on IP address."""
     try:
         response = requests.get("https://ipinfo.io/json", timeout=5)
         data = response.json()
-        return f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}"
-    except requests.RequestException:
+        return f"{data.get('city','N/A')}, {data.get('country','N/A')}"
+    except Exception:
         return "Location N/A"
 
 @st.cache_data(ttl=60)
 def load_data(_conn):
-    """Loads and cleans transaction data from the Google Sheet."""
+    """Read sheet, coerce columns and types, return DataFrame with expected columns."""
     try:
         df = _conn.read(usecols=list(range(8)), ttl=60)
         if df is None:
-            return pd.DataFrame(columns=[
-                'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction',
-                'Entered by', 'Timestamp', 'Location'
-            ])
+            return pd.DataFrame(columns=['Transaction','Amount','Type','Paid by','Date of Transaction','Entered by','Timestamp','Location'])
         df.dropna(how="all", inplace=True)
-        expected_cols = ['Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 'Entered by', 'Timestamp', 'Location']
+        expected_cols = ['Transaction','Amount','Type','Paid by','Date of Transaction','Entered by','Timestamp','Location']
         for c in expected_cols:
             if c not in df.columns:
                 df[c] = pd.NA
@@ -183,21 +147,18 @@ def load_data(_conn):
         df = df.sort_values(by="Date of Transaction", na_position='last').reset_index(drop=True)
         return df
     except Exception as e:
-        st.error(f"Failed to load data from Google Sheets: {e}")
-        return pd.DataFrame(columns=[
-            'Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction',
-            'Entered by', 'Timestamp', 'Location'
-        ])
+        st.error(f"Failed to read sheet data: {e}")
+        return pd.DataFrame(columns=['Transaction','Amount','Type','Paid by','Date of Transaction','Entered by','Timestamp','Location'])
 
 def save_data(_conn, df):
-    """Saves the DataFrame to the Google Sheet using the library's update method."""
+    """Write the DataFrame back to Google Sheets in a stable column order."""
     try:
         df_copy = df.copy()
         if 'Date of Transaction' in df_copy.columns:
             df_copy['Date of Transaction'] = pd.to_datetime(df_copy['Date of Transaction'], errors='coerce').dt.strftime('%Y-%m-%d')
         if 'Timestamp' in df_copy.columns:
             df_copy['Timestamp'] = pd.to_datetime(df_copy['Timestamp'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
-        desired_order = ['Transaction', 'Amount', 'Type', 'Paid by', 'Date of Transaction', 'Entered by', 'Timestamp', 'Location']
+        desired_order = ['Transaction','Amount','Type','Paid by','Date of Transaction','Entered by','Timestamp','Location']
         for col in desired_order:
             if col not in df_copy.columns:
                 df_copy[col] = ""
@@ -208,26 +169,23 @@ def save_data(_conn, df):
         st.error(f"Failed to save data to Google Sheets: {e}")
 
 def calculate_balance_and_summary(df):
-    """Calculates the balance and a summary dictionary for display."""
     if df is None or df.empty:
         return 0.0, {
             'total_paid_by_AK': 0, 'total_paid_by_AA': 0, 'shared_expenses': 0,
             'shared_paid_by_ak': 0, 'shared_paid_by_aa': 0, 'ak_only_paid_by_aa': 0,
             'aa_only_paid_by_ak': 0, 'repayment_ak_to_aa': 0, 'repayment_aa_to_ak': 0,
         }
-
     summary = {
-        'total_paid_by_AK': df[df['Paid by'] == 'AK']['Amount'].sum(),
-        'total_paid_by_AA': df[df['Paid by'] == 'AA']['Amount'].sum(),
-        'shared_expenses': df[df['Type'] == 'Shared Expense']['Amount'].sum(),
-        'shared_paid_by_ak': df[(df['Type'] == 'Shared Expense') & (df['Paid by'] == 'AK')]['Amount'].sum(),
-        'shared_paid_by_aa': df[(df['Type'] == 'Shared Expense') & (df['Paid by'] == 'AA')]['Amount'].sum(),
-        'ak_only_paid_by_aa': df[(df['Type'] == 'For AK only') & (df['Paid by'] == 'AA')]['Amount'].sum(),
-        'aa_only_paid_by_ak': df[(df['Type'] == 'For AA only') & (df['Paid by'] == 'AK')]['Amount'].sum(),
-        'repayment_ak_to_aa': df[df['Type'] == 'Repayment from AK to AA']['Amount'].sum(),
-        'repayment_aa_to_ak': df[df['Type'] == 'Repayment from AA to AK']['Amount'].sum(),
+        'total_paid_by_AK': df[df['Paid by']=='AK']['Amount'].sum(),
+        'total_paid_by_AA': df[df['Paid by']=='AA']['Amount'].sum(),
+        'shared_expenses': df[df['Type']=='Shared Expense']['Amount'].sum(),
+        'shared_paid_by_ak': df[(df['Type']=='Shared Expense') & (df['Paid by']=='AK')]['Amount'].sum(),
+        'shared_paid_by_aa': df[(df['Type']=='Shared Expense') & (df['Paid by']=='AA')]['Amount'].sum(),
+        'ak_only_paid_by_aa': df[(df['Type']=='For AK only') & (df['Paid by']=='AA')]['Amount'].sum(),
+        'aa_only_paid_by_ak': df[(df['Type']=='For AA only') & (df['Paid by']=='AK')]['Amount'].sum(),
+        'repayment_ak_to_aa': df[df['Type']=='Repayment from AK to AA']['Amount'].sum(),
+        'repayment_aa_to_ak': df[df['Type']=='Repayment from AA to AK']['Amount'].sum(),
     }
-
     ak_share = summary['shared_expenses'] / 2.0 if summary['shared_expenses'] > 0 else 0.0
     balance = summary['shared_paid_by_ak'] - ak_share
     balance += summary['aa_only_paid_by_ak']
@@ -253,51 +211,48 @@ def df_equivalent(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     except Exception:
         return False
 
-# --- LOGIN UI using streamlit-authenticator ---
-auth_result = authenticator.login(location="main")
+# --- LOGIN FLOW (compatible with recent streamlit-authenticator versions) ---
+auth_result = authenticator.login(location="main")  # returns dict in recent versions
 
-if auth_result and auth_result.get("authenticated"):
-    authenticator.logout("Logout", "sidebar")
-    username = auth_result["username"]
-    name = auth_result.get("name", username)
-    st.sidebar.success(f"Welcome, {name} 👋")
+if auth_result is None:
+    # login widget rendered but user hasn't interacted yet
+    st.warning("Please log in to continue.")
+    st.stop()
 
-elif auth_result and not auth_result.get("authenticated"):
-    st.error("Invalid username or password")
-    
+# auth_result typically looks like: {"name": "...", "username":"...", "authenticated": True/False}
+if isinstance(auth_result, dict) and auth_result.get("authenticated") is True:
+    # successful login
+    current_username = auth_result.get("username")
+    current_name = auth_result.get("name", current_username)
+    # show logout in sidebar (authenticator handles cookie clearing)
+    with st.sidebar:
+        if authenticator.logout("Logout", "sidebar"):
+            st.experimental_rerun()
+        st.success(f"Welcome, {current_name}!")
 else:
-    st.warning("Please log in to continue")
+    # authentication failed
+    st.error("Invalid username or password.")
+    st.stop()
 
-# User successfully logged in; username is the key we used in credentials (AK / AA)
-current_user = username  # "AK" or "AA"
-st.session_state["user"] = current_user
-
-# Provide a logout button in the sidebar using authenticator
-with st.sidebar:
-    if authenticator.logout("Logout", "sidebar"):
-        # streamlit-authenticator handles cookie clearing
-        st.experimental_rerun()
-
-# --- MAIN APP LOGIC ---
+# --- MAIN APP LOGIC (after successful login) ---
 transactions_df = load_data(conn)
 
-# --- UI DISPLAY ---
 st.title("💸 AK & AA Shared Expense Tracker")
 st.markdown("A persistent expense tracker powered by Google Sheets.")
 st.markdown("---")
 
 col1, col2, col3 = st.columns(3)
-total_shared = transactions_df['Amount'][transactions_df['Type'] == 'Shared Expense'].sum() if not transactions_df.empty else 0.0
-total_paid_by_user = transactions_df['Amount'][transactions_df['Paid by'] == current_user].sum() if not transactions_df.empty else 0.0
+total_shared = transactions_df['Amount'][transactions_df['Type']=='Shared Expense'].sum() if not transactions_df.empty else 0.0
+total_paid_by_user = transactions_df['Amount'][transactions_df['Paid by']==current_username].sum() if not transactions_df.empty else 0.0
 col1.metric("Total Shared Spending", f"₹{total_shared:,.2f}")
-col2.metric(f"Total Paid by You ({current_user})", f"₹{total_paid_by_user:,.2f}")
+col2.metric(f"Total Paid by You ({current_username})", f"₹{total_paid_by_user:,.2f}")
 col3.metric("Total Transactions", f"{len(transactions_df)}")
 
 st.markdown("---")
 
 balance, summary_data = calculate_balance_and_summary(transactions_df)
 
-_, center_col, _ = st.columns([1, 2, 1])
+_, center_col, _ = st.columns([1,2,1])
 with center_col:
     if balance > 0.01:
         card_class, title, amount_display = "positive", "Final Balance: AA owes AK", f"₹{balance:,.2f}"
@@ -309,27 +264,25 @@ with center_col:
     st.markdown(f'<div class="balance-card {card_class}"><h3>{title}</h3><p class="amount">{amount_display}</p></div>', unsafe_allow_html=True)
     st.caption(f"Last refreshed: {datetime.datetime.now().strftime('%d %b %Y, %I:%M:%S %p')} (local)")
 
-# --- VISUAL SUMMARY (new) ---
+# --- VISUAL SUMMARY: bar + pie using altair ---
 st.markdown("### Quick Visual: Who paid what?")
 if not transactions_df.empty:
-    # Aggregate sums by Paid by
-    bypayer = transactions_df.groupby("Paid by", dropna=False)["Amount"].sum().reset_index()
-    # bar chart
-    bar = alt.Chart(bypayer).mark_bar().encode(
+    by_payer = transactions_df.groupby("Paid by", dropna=False)["Amount"].sum().reset_index()
+    bar = alt.Chart(by_payer).mark_bar().encode(
         x=alt.X('Paid by:N', title='Paid by'),
         y=alt.Y('Amount:Q', title='Total Amount (₹)'),
         tooltip=[alt.Tooltip('Paid by:N'), alt.Tooltip('Amount:Q', format=",.2f")]
-    ).properties(height=250)
-    # pie-like chart using stacked arc
-    pie = alt.Chart(bypayer).mark_arc().encode(
+    ).properties(height=260)
+
+    pie = alt.Chart(by_payer).mark_arc(innerRadius=20).encode(
         theta=alt.Theta(field="Amount", type="quantitative"),
         color=alt.Color(field="Paid by", type="nominal"),
         tooltip=[alt.Tooltip('Paid by:N'), alt.Tooltip('Amount:Q', format=",.2f")]
-    ).properties(height=250, width=250)
+    ).properties(height=260, width=260)
 
-    cols = st.columns([2, 1])
-    cols[0].altair_chart(bar, use_container_width=True)
-    cols[1].altair_chart(pie, use_container_width=True)
+    c1, c2 = st.columns([2,1])
+    c1.altair_chart(bar, use_container_width=True)
+    c2.altair_chart(pie, use_container_width=True)
 else:
     st.info("No transactions yet — add one in the sidebar to see visual summaries.")
 
@@ -337,8 +290,7 @@ st.markdown("---")
 
 with st.expander("Show Calculation Breakdown"):
     st.subheader("High-Level Summary (from AK's perspective)")
-
-    ak_share = summary_data['shared_expenses'] / 2.0 if summary_data['shared_expenses'] > 0 else 0.0
+    ak_share = summary_data['shared_expenses']/2.0 if summary_data['shared_expenses']>0 else 0.0
     ak_overpayment = summary_data['shared_paid_by_ak'] - ak_share
 
     st.markdown("##### 1. Shared Costs Analysis")
@@ -371,25 +323,22 @@ with st.expander("Show Calculation Breakdown"):
         running_balance = 0.0
         st.markdown(f"**Initial Balance:** `₹{running_balance:,.2f}`")
         st.markdown("---")
-
         for index, row in transactions_df.iterrows():
-            st.markdown(f"**Transaction {index + 1}:** *{row['Transaction']}* (`₹{row['Amount']:,.2f}`)")
-
+            st.markdown(f"**Transaction {index+1}:** *{row['Transaction']}* (`₹{row['Amount']:,.2f}`)")
             logic_text = ""
             balance_change = 0.0
-
             if row['Type'] == 'Shared Expense':
-                share = row['Amount'] / 2.0
+                share = row['Amount']/2.0
                 if row['Paid by'] == 'AK':
                     balance_change = share
                     logic_text = f"Shared cost paid by AK. Balance increases (AA owes more): `+₹{share:,.2f}`."
                 else:
                     balance_change = -share
                     logic_text = f"Shared cost paid by AA. Balance decreases (AK owes more): `-₹{share:,.2f}`."
-            elif row['Type'] == 'For AA only' and row['Paid by'] == 'AK':
+            elif row['Type'] == 'For AA only' and row['Paid by']=='AK':
                 balance_change = row['Amount']
                 logic_text = f"AK paid for AA. Balance increases: `+₹{row['Amount']:,.2f}`."
-            elif row['Type'] == 'For AK only' and row['Paid by'] == 'AA':
+            elif row['Type'] == 'For AK only' and row['Paid by']=='AA':
                 balance_change = -row['Amount']
                 logic_text = f"AA paid for AK. Balance decreases: `-₹{row['Amount']:,.2f}`."
             elif row['Type'] == 'Repayment from AA to AK':
@@ -398,14 +347,13 @@ with st.expander("Show Calculation Breakdown"):
             elif row['Type'] == 'Repayment from AK to AA':
                 balance_change = row['Amount']
                 logic_text = f"AK repaid AA. AK's debt reduces. Balance increases: `+₹{row['Amount']:,.2f}`."
-
             st.markdown(f"> *{logic_text}*")
             new_running_balance = running_balance + balance_change
             st.markdown(f"> **New Balance:** `{running_balance:,.2f} + ({balance_change:,.2f}) =` **`₹{new_running_balance:,.2f}`**")
             running_balance = new_running_balance
             st.markdown("---")
 
-# --- SIDEBAR: Add New Transaction ---
+# --- SIDEBAR: Add New Transaction (keeps original behavior, improves reliability) ---
 with st.sidebar:
     st.header("Add New Transaction")
     with st.form("new_transaction_form", clear_on_submit=True):
@@ -413,16 +361,19 @@ with st.sidebar:
         amount = st.number_input("Amount (₹)", min_value=0.01, format="%.2f")
         transaction_date = st.date_input("Date of Transaction", datetime.date.today())
         paid_by = st.selectbox("Paid by", ["AK", "AA"], index=0)
-        trans_type = st.selectbox("Type", ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AA to AK'], index=0)
-
+        trans_type = st.selectbox("Type", ['Shared Expense','For AK only','For AA only','Repayment from AK to AA','Repayment from AA to AK'], index=0)
         if st.form_submit_button("Add Transaction"):
             if not transaction or amount <= 0:
                 st.warning("Please fill in all fields with a valid amount.")
             else:
                 new_entry = pd.DataFrame([{
-                    "Transaction": transaction, "Amount": amount, "Type": trans_type,
-                    "Paid by": paid_by, "Date of Transaction": transaction_date,
-                    "Entered by": current_user, "Timestamp": datetime.datetime.now(datetime.timezone.utc),
+                    "Transaction": transaction,
+                    "Amount": amount,
+                    "Type": trans_type,
+                    "Paid by": paid_by,
+                    "Date of Transaction": transaction_date,
+                    "Entered by": current_username,
+                    "Timestamp": datetime.datetime.now(datetime.timezone.utc),
                     "Location": get_location()
                 }])
                 updated_df = pd.concat([transactions_df, new_entry], ignore_index=True)
@@ -438,50 +389,36 @@ st.header("Transaction History")
 filtered_df = transactions_df.copy()
 
 st.subheader("Filter Transactions")
-filter_cols = st.columns([1, 1, 2])
+filter_cols = st.columns([1,1,2])
 
 with filter_cols[0]:
-    paid_by_options = transactions_df["Paid by"].dropna().unique().tolist() if not transactions_df.empty else ["AK", "AA"]
-    paid_by_filter = st.multiselect(
-        "Paid by",
-        options=paid_by_options,
-        default=paid_by_options
-    )
+    paid_by_options = transactions_df["Paid by"].dropna().unique().tolist() if not transactions_df.empty else ["AK","AA"]
+    paid_by_filter = st.multiselect("Paid by", options=paid_by_options, default=paid_by_options)
 
 with filter_cols[1]:
-    type_options = transactions_df["Type"].dropna().unique().tolist() if not transactions_df.empty else ['Shared Expense', 'For AK only', 'For AA only', 'Repayment from AK to AA', 'Repayment from AA to AK']
-    type_filter = st.multiselect(
-        "Type",
-        options=type_options,
-        default=type_options
-    )
+    type_options = transactions_df["Type"].dropna().unique().tolist() if not transactions_df.empty else ['Shared Expense','For AK only','For AA only','Repayment from AK to AA','Repayment from AA to AK']
+    type_filter = st.multiselect("Type", options=type_options, default=type_options)
 
 with filter_cols[2]:
     if not transactions_df.empty and transactions_df['Date of Transaction'].notna().any():
         valid_dates = [d for d in transactions_df['Date of Transaction'].tolist() if pd.notna(d)]
         if valid_dates:
-            min_date = min(valid_dates)
-            max_date = max(valid_dates)
-            if min_date > max_date:
-                min_date = max_date
-            date_range = st.date_input(
-                "Select date range",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date
-            )
+            min_date = min(valid_dates); max_date = max(valid_dates)
+            if min_date > max_date: min_date = max_date
+            date_range = st.date_input("Select date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
         else:
             date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
     else:
         date_range = st.date_input("Select date range", value=(datetime.date.today(), datetime.date.today()))
 
+# apply filters
 if paid_by_filter:
     filtered_df = filtered_df[filtered_df["Paid by"].isin(paid_by_filter)]
 if type_filter:
     filtered_df = filtered_df[filtered_df["Type"].isin(type_filter)]
 
 try:
-    if isinstance(date_range, tuple) and len(date_range) == 2:
+    if isinstance(date_range, tuple) and len(date_range)==2:
         start_date, end_date = date_range
         filtered_df = filtered_df[
             (filtered_df["Date of Transaction"].notna()) &
@@ -495,7 +432,7 @@ except Exception:
     pass
 
 def color_row(row):
-    t = row.get("Type", "")
+    t = row.get("Type","")
     if t == "Shared Expense":
         return ["background-color: #e6ffe6"] * len(row)
     if "Repayment" in str(t):
@@ -519,13 +456,7 @@ if 'Date of Transaction' in transactions_df.columns:
 if 'Timestamp' in transactions_df.columns:
     column_config['Timestamp'] = st.column_config.DatetimeColumn("Entry Timestamp", format="D MMM YYYY, h:mm a")
 
-edited_df = st.data_editor(
-    transactions_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config=column_config,
-    key="data_editor"
-)
+edited_df = st.data_editor(transactions_df, num_rows="dynamic", use_container_width=True, column_config=column_config, key="data_editor")
 
 if not df_equivalent(transactions_df, edited_df):
     save_data(conn, edited_df)
